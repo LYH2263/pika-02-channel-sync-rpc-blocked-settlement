@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Type, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union, Type, cast
 
 from pika import frame
 from pika import amqp_object
@@ -297,6 +297,60 @@ class CallbackManager:
         """
         del self._stack[prefix][key]
         self._cleanup_callback_dict(prefix, key)
+
+    def remove_reply_callbacks(self, prefix: _Prefix, reply_keys: Iterable[
+        Union[AMQPValue, Tuple[AMQPValue, Optional[Dict[str, Any]]]]],
+                               callback_value: Callable[..., Any]) -> int:
+        """Remove `callback_value` from the stack for each AMQP reply key.
+
+        `reply_keys` mirrors the accepted form of reply registration used
+        by `Channel._rpc`: each entry is either a key or a
+        ``(key, arguments)`` tuple. This is the reply-callback cleanup path
+        for a synchronous RPC whose wait is abandoned before its reply
+        arrives; it removes only `callback_value`'s own registrations, so a
+        shared reply key of another in-flight RPC (including its
+        `_on_synchronous_complete` registration) is left untouched.
+
+        Missing prefixes, keys and non-matching callbacks are ignored.
+
+        :param str|int prefix: Categorize the callback
+        :param reply_keys: iterable of keys or ``(key, arguments)`` pairs
+        :param callable callback_value: The callback to remove
+        :returns: number of callback entries actually removed
+        :rtype: int
+
+        """
+        removed = 0
+        prefix = name_or_value(prefix)
+
+        for reply_key in reply_keys:
+            if isinstance(reply_key, tuple):
+                key, arguments = reply_key
+            else:
+                key, arguments = reply_key, None
+
+            key = name_or_value(key)
+
+            if prefix not in self._stack or key not in self._stack[prefix]:
+                continue
+
+            offsets_to_remove = list()
+            for offset in range(len(self._stack[prefix][key]), 0, -1):
+                callback_dict = self._stack[prefix][key][offset - 1]
+
+                if (callback_dict[self.CALLBACK] == callback_value and
+                        self._arguments_match(callback_dict, [arguments])):
+                    offsets_to_remove.append(offset - 1)
+
+            for offset in offsets_to_remove:
+                LOGGER.debug('Removing abandoned reply callback #%i: %r',
+                             offset, self._stack[prefix][key][offset])
+                del self._stack[prefix][key][offset]
+                removed += 1
+
+            self._cleanup_callback_dict(prefix, key)
+
+        return removed
 
     def _arguments_match(self, callback_dict: Dict[str, Any],
                          args: List[Any]) -> bool:
