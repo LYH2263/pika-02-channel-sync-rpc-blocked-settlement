@@ -1441,7 +1441,14 @@ class BlockingChannel:
         if not waiters:
             waiters = self._ALWAYS_READY_WAITERS
 
-        self._connection._flush_output(lambda: self.is_closed, *waiters)
+        sync_window = self._impl._begin_sync_wait_window(claim_pending=True)
+        try:
+            self._connection._flush_output(lambda: self.is_closed, *waiters)
+        except BaseException:
+            self._impl._end_sync_wait_window(sync_window, abandon=True)
+            raise
+        else:
+            self._impl._end_sync_wait_window(sync_window)
 
         if self.is_closed and isinstance(self._closing_reason,
                                          exceptions.ChannelClosedByBroker):

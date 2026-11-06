@@ -9,9 +9,9 @@ import logging
 import uuid
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Union
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union)
 
-from pika import exceptions, frame, spec, validators
+from pika import amqp_object, exceptions, frame, spec, validators
 from pika._utils import as_bytes, override
 from pika.exchange_type import ExchangeType
 
@@ -58,6 +58,89 @@ _OnReturnCallback = Callable[
 _OnTxCommitCallback = Callable[[frame.Method[spec.Tx.CommitOk]], None]
 _OnTxRollbackCallback = Callable[[frame.Method[spec.Tx.RollbackOk]], None]
 _OnTxSelectCallback = Callable[[frame.Method[spec.Tx.SelectOk]], None]
+
+
+class _SyncRpcSettlement:
+    """Settlement bookkeeping for one `Channel._rpc` synchronous request.
+
+    A settlement binds together the request's blocked-queue slot, the
+    reply callbacks registered for its acceptable replies and the nested
+    wait window it belongs to. Completion and abandonment are therefore
+    scoped to a single request instead of clearing one shared
+    `_blocking` value or draining the whole `_blocked` queue, which is
+    what allows nested synchronous waits on the same channel to settle
+    without writing through an outer, still-pending waiter.
+
+    """
+
+    # The request is waiting in `Channel._blocked`; nothing was sent and
+    # no reply callbacks were registered yet.
+    ENQUEUED = 'enqueued'
+    # The method was sent; `_blocking` is held and reply callbacks are
+    # registered.
+    IN_FLIGHT = 'in_flight'
+    # The acceptable reply arrived (or a queued Channel.Close was
+    # fulfilled via meta-close).
+    SETTLED = 'settled'
+    # The wait was given up (nested wait window abandoned, remote close
+    # while queued, or channel cleanup). A queued request is unsent; an
+    # in-flight request has its user reply callbacks detached.
+    ABANDONED = 'abandoned'
+
+    __slots__ = ('method', 'callback', 'acceptable_replies', 'window', 'state',
+                 'blocked_entry')
+
+    def __init__(self, method: amqp_object.Method,
+                 callback: Optional[Callable[..., Any]],
+                 acceptable_replies: Optional[Sequence[Union[
+                     Type[amqp_object.Method], Tuple[Type[amqp_object.Method],
+                                                     Dict[str, Any]]]]],
+                 window: 'Optional[_SyncWaitWindow]') -> None:
+        self.method = method
+        self.callback = callback
+        self.acceptable_replies = acceptable_replies
+        self.window = window
+        self.state = self.ENQUEUED
+        self.blocked_entry: 'Optional[_BlockedSyncRpc]' = None
+
+
+class _SyncWaitWindow:
+    """One nesting level of synchronous-RPC waiting on a Channel.
+
+    A host (a `BlockingChannel` flush-wait, a `TwistedChannel` Deferred,
+    or a direct callback-style user) declares a window around waiting
+    for a synchronous reply. Synchronous requests initiated while the
+    window is open are bound to it. Ending the window normally restores
+    the enclosing window's blocking/enqueued view; ending it with
+    abandon removes exactly the window's own blocked entries and reply
+    callbacks without touching the outer waiter.
+
+    """
+
+    __slots__ = ('parent', 'depth', 'settlements')
+
+    def __init__(self, parent: 'Optional[_SyncWaitWindow]') -> None:
+        self.parent: Optional[_SyncWaitWindow] = parent
+        self.depth: int = parent.depth + 1 if parent is not None else 1
+        self.settlements: List[_SyncRpcSettlement] = []
+
+
+class _BlockedSyncRpc(list):
+    """A `Channel._blocked` queue entry.
+
+    It is the pin-compatible ``[method, callback, acceptable_replies]``
+    triple (comparison against a plain list is unchanged) carrying the
+    settlement that owns it.
+
+    """
+
+    __slots__ = ('settlement',)
+
+    def __init__(self, triple: List[Any],
+                 settlement: _SyncRpcSettlement) -> None:
+        super().__init__(triple)
+        self.settlement = settlement
+
 
 
 class Channel:
@@ -113,6 +196,9 @@ class Channel:
 
         self._blocked: deque = deque()
         self._blocking: Any | None = None
+        # Nested sync-RPC wait settlement ledger (host-facing).
+        self._sync_wait_windows: List[_SyncWaitWindow] = []
+        self._active_settlement: Optional[_SyncRpcSettlement] = None
         self._has_on_flow_callback: bool = False
         self._cancelled: set = set()
         # Nowait-cancelled tags in cancellation order, bounding how many of
@@ -1164,6 +1250,8 @@ class Channel:
 
     def _cleanup(self) -> None:
         """Remove all consumers and any callbacks for the channel."""
+        # Tear down the synchronous-RPC settlement ledger.
+        self._fail_pending_settlements()
         self.callbacks.process(self.channel_number,
                                self._ON_CHANNEL_CLEANUP_CB_KEY, self, self)
         self._consumers = {}
@@ -1518,58 +1606,342 @@ class Channel:
 
     def _on_synchronous_complete(self,
                                  _method_frame_unused: frame.Method) -> None:
-        """
-        This is called when a synchronous command is completed.
+        """This is called when a synchronous command is completed. It will undo
+        the blocking state and send all the frames that stacked up while we
+        were in the blocking state.
 
-        It will undo the blocking state and send all the frames that stacked up while we were in the
-        blocking state.
+        Completion is scoped to the settlement of the method whose reply
+        arrived: only it is marked settled and its waiter is released;
+        blocked entries belonging to abandoned nested waits are dropped
+        instead of being sent.
 
-        :param _method_frame_unused: The method frame received
+        :param pika.frame.Method method_frame_unused: The method frame received
+
         """
         LOGGER.debug('%i blocked frames', len(self._blocked))
+        settlement = self._active_settlement
+        if settlement is not None:
+            # The settlement may already be ABANDONED if its host gave up
+            # waiting while the method was in flight; the wire reply still
+            # settles it and releases blocking.
+            settlement.state = _SyncRpcSettlement.SETTLED
+            self._active_settlement = None
         self._blocking = None
         # self._blocking must be checked here as a callback could
         # potentially change the state of that variable during an
         # iteration of the while loop
         while self._blocked and self._blocking is None:
-            self._rpc(*self._blocked.popleft())
+            self._continue_blocked_rpc(self._blocked.popleft())
 
     def _drain_blocked_methods_on_remote_close(self) -> None:
-        """
-        This is called when the broker sends a Channel.Close while the client is in CLOSING state.
-        This method checks the blocked method queue for a pending client-initiated Channel.Close
-        method and ensures its callbacks are processed, but does not send the method to the broker.
+        """This is called when the broker sends a Channel.Close while the
+        client is in CLOSING state. This method checks the blocked method
+        queue for a pending client-initiated Channel.Close method and
+        ensures its callbacks are processed, but does not send the method
+        to the broker.
 
-        The broker may close the channel before responding to outstanding in-transit synchronous
-        methods, or even before these methods have been sent to the broker. AMQP 0.9.1 obliges the
-        server to drop all methods arriving on a closed channel other than Channel.CloseOk and
-        Channel.Close. Since the response to a synchronous method that blocked the channel never
-        arrives, the channel never becomes unblocked, and the Channel.Close, if any, in the blocked
-        queue has no opportunity to be sent, and thus its completion callback would never be called.
+        This is a different exit from the normal
+        `_on_synchronous_complete` continuation: a queued client
+        Channel.Close is fulfilled exclusively through the meta-close
+        path, while every other queued synchronous method is abandoned
+        and dropped: it is never sent and its waiters are not invoked.
+
+        The broker may close the channel before responding to outstanding
+        in-transit synchronous methods, or even before these methods have been
+        sent to the broker. AMQP 0.9.1 obliges the server to drop all methods
+        arriving on a closed channel other than Channel.CloseOk and
+        Channel.Close. Since the response to a synchronous method that blocked
+        the channel never arrives, the channel never becomes unblocked, and the
+        Channel.Close, if any, in the blocked queue has no opportunity to be
+        sent, and thus its completion callback would never be called.
+
         """
         LOGGER.debug(
             'Draining %i blocked frames due to broker-requested Channel.Close',
             len(self._blocked))
         while self._blocked:
-            method = self._blocked.popleft()[0]
+            entry = self._blocked.popleft()
+            method = entry[0]
+            settlement = getattr(entry, 'settlement', None)
             if isinstance(method, spec.Channel.Close):
+                # The client's close is fulfilled by meta-close rather
+                # than a CloseOk that will now never be requested.
+                if settlement is not None:
+                    settlement.state = _SyncRpcSettlement.SETTLED
                 # The desired reason is already in self._closing_reason
                 self._on_close_meta(self._closing_reason)
             else:
+                if settlement is not None:
+                    self._abandon_settlement(settlement)
                 LOGGER.debug('Ignoring drained blocked method: %s', method)
+
+    def _fail_pending_settlements(self) -> None:
+        """Mark every settlement still on the synchronous-RPC ledger as
+        abandoned without attempting reply-callback removal: channel
+        cleanup purges all of the channel's callbacks right after this.
+
+        """
+        while self._blocked:
+            entry = self._blocked.popleft()
+            settlement = getattr(entry, 'settlement', None)
+            if (settlement is not None and
+                    settlement.state == _SyncRpcSettlement.ENQUEUED):
+                settlement.state = _SyncRpcSettlement.ABANDONED
+
+        if self._active_settlement is not None:
+            self._active_settlement.state = _SyncRpcSettlement.ABANDONED
+            self._active_settlement = None
+
+        self._sync_wait_windows.clear()
+        self._blocking = None
+
+    def _continue_blocked_rpc(self, entry: List[Any]) -> None:
+        """Resume one request drained from `_blocked`: send it unless its
+        settlement was abandoned while it was queued, in which case drop
+        it without putting it on the wire.
+
+        :param list entry: the ``[method, callback, acceptable_replies]``
+            triple drained from `_blocked`, optionally carrying a settlement
+
+        """
+        settlement = getattr(entry, 'settlement', None)
+        if settlement is None:
+            # Pin-compatible path for externally queued raw triples
+            self._rpc(*entry)
+        elif settlement.state == _SyncRpcSettlement.ABANDONED:
+            LOGGER.debug('Skipping abandoned blocked method: %s',
+                         settlement.method)
+        else:
+            self._launch_rpc(entry[0], entry[1], entry[2], settlement)
+
+    def _make_settlement(
+        self, method: amqp_object.Method,
+        callback: Optional[Callable[..., Any]], acceptable_replies: Optional[
+            Sequence[Union[Type[amqp_object.Method],
+                           Tuple[Type[amqp_object.Method], Dict[str, Any]]]]]
+    ) -> _SyncRpcSettlement:
+        """Create the settlement for a new `_rpc` request and bind it to
+        the innermost open wait window, if any.
+
+        """
+        window = self._sync_wait_windows[-1] if self._sync_wait_windows else None
+        settlement = _SyncRpcSettlement(method, callback, acceptable_replies,
+                                        window)
+        if window is not None:
+            window.settlements.append(settlement)
+        return settlement
+
+    def _launch_rpc(self, method: amqp_object.Method,
+                    callback: Optional[Callable[..., Any]],
+                    acceptable_replies: Optional[Sequence[Union[
+                        Type[amqp_object.Method],
+                        Tuple[Type[amqp_object.Method], Dict[str, Any]]]]],
+                    settlement: _SyncRpcSettlement) -> None:
+        """Send one synchronous method and register its reply callbacks.
+
+        Shared by the idle path of `_rpc` and by blocked-queue draining
+        in `_on_synchronous_complete`, so both exits register the exact
+        same settlement-scoped callbacks.
+
+        """
+        # Note: _send_method can throw exceptions if there are framing errors
+        # or invalid data passed in. Call it here to prevent self._blocking
+        # from being set if an exception is thrown. This also prevents
+        # acceptable_replies registering callbacks when exceptions are thrown
+        self._send_method(method)
+
+        if not acceptable_replies:
+            # No reply is expected (e.g. a nowait method); nothing settles
+            # later and nothing blocks the channel.
+            settlement.state = _SyncRpcSettlement.SETTLED
+            return
+
+        # If acceptable replies are set, add callbacks
+        # Block until a response frame is received for synchronous frames
+        self._blocking = method.NAME
+        settlement.state = _SyncRpcSettlement.IN_FLIGHT
+        settlement.blocked_entry = None
+        self._active_settlement = settlement
+        LOGGER.debug(
+            'Entering blocking state on frame %s; acceptable_replies=%r',
+            method, acceptable_replies)
+
+        for reply in acceptable_replies:
+            if isinstance(reply, tuple):
+                reply, arguments = reply
+            else:
+                arguments = None
+            LOGGER.debug('Adding on_synchronous_complete callback')
+            self.callbacks.add(self.channel_number,
+                               reply,
+                               self._on_synchronous_complete,
+                               arguments=arguments)
+            if callback is not None:
+                LOGGER.debug('Adding passed-in RPC response callback')
+                self.callbacks.add(self.channel_number,
+                                   reply,
+                                   callback,
+                                   arguments=arguments)
+
+    def _begin_sync_wait_window(self,
+                                claim_pending: bool = False) -> _SyncWaitWindow:
+        """Declare a nested synchronous-RPC wait window on this channel.
+
+        A host calls this around waiting for one synchronous reply. While
+        the window is open, new `_rpc` requests are bound to it instead
+        of to the enclosing window whose waiter is still pending.
+
+        :param bool claim_pending: when True, bind the most recent still
+            pending settlement to the new window. Hosts that issue the
+            `_rpc` before declaring the wait window (BlockingChannel's
+            call-then-flush ordering) need this; hosts that declare the
+            window first (TwistedChannel's Deferreds) leave it False.
+        :rtype: _SyncWaitWindow
+
+        """
+        parent = self._sync_wait_windows[-1] if self._sync_wait_windows else None
+        window = _SyncWaitWindow(parent)
+        self._sync_wait_windows.append(window)
+        if claim_pending:
+            self._claim_pending_settlement(window, parent)
+        LOGGER.debug(
+            'Opened synchronous RPC wait window depth=%i '
+            '(claim_pending=%r)', window.depth, claim_pending)
+        return window
+
+    def _claim_pending_settlement(self, window: _SyncWaitWindow,
+                                  parent: Optional[_SyncWaitWindow]) -> None:
+        """Bind the newest pending settlement to a window declared after
+        its `_rpc` was issued.
+
+        An enqueued tail entry (a request stacked up behind the outer
+        blocking method) is claimed when owned by nobody or by the
+        parent window; otherwise the in-flight method is claimed only
+        when nobody owns it. An in-flight method already owned by an
+        outer window is never stolen.
+
+        """
+        candidate: Optional[_SyncRpcSettlement] = None
+        if self._blocked:
+            tail = getattr(self._blocked[-1], 'settlement', None)
+            if (tail is not None and
+                    tail.state == _SyncRpcSettlement.ENQUEUED and
+                (tail.window is None or tail.window is parent)):
+                candidate = tail
+        elif (self._active_settlement is not None and
+              self._active_settlement.state == _SyncRpcSettlement.IN_FLIGHT and
+              self._active_settlement.window is None):
+            candidate = self._active_settlement
+
+        if candidate is not None:
+            self._rebind_settlement(candidate, window)
+
+    @staticmethod
+    def _rebind_settlement(settlement: _SyncRpcSettlement,
+                           window: Optional[_SyncWaitWindow]) -> None:
+        """Move a settlement's ownership to `window` (None = outer root)."""
+        if settlement.window is not None:
+            try:
+                settlement.window.settlements.remove(settlement)
+            except ValueError:
+                pass
+        settlement.window = window
+        if window is not None:
+            window.settlements.append(settlement)
+
+    def _end_sync_wait_window(self,
+                              window: _SyncWaitWindow,
+                              abandon: bool = False) -> None:
+        """Close a wait window opened by `_begin_sync_wait_window`.
+
+        Normal close restores the enclosing window's blocking/enqueued
+        view: any settlement still pending is returned to the parent
+        window instead of vanishing with this one. Abandoning close
+        gives up exactly this window's own settlements: queued requests
+        are removed unsent, in-flight requests have their user reply
+        callbacks detached, and the outer pending waiter is never
+        touched or signalled.
+
+        :param _SyncWaitWindow window: the window returned by begin
+        :param bool abandon: True when the wait ends without a reply
+            (timeout, popup, host error, close errback)
+
+        """
+        try:
+            self._sync_wait_windows.remove(window)
+        except ValueError:
+            return
+
+        parent = window.parent
+        for settlement in list(window.settlements):
+            if settlement.state in (_SyncRpcSettlement.SETTLED,
+                                    _SyncRpcSettlement.ABANDONED):
+                continue
+            if abandon:
+                self._abandon_settlement(settlement)
+            else:
+                # Restore the outer enqueue/blocking intent
+                self._rebind_settlement(settlement, parent)
+        window.settlements.clear()
+        LOGGER.debug(
+            'Closed synchronous RPC wait window depth=%i '
+            '(abandon=%r)', window.depth, abandon)
+
+    def _abandon_settlement(self, settlement: _SyncRpcSettlement) -> None:
+        """Give up one settlement without settling its host waiter.
+
+        A queued request is pulled out of `_blocked` (it never registered
+        reply callbacks). An in-flight request keeps its registered
+        `_on_synchronous_complete` so the eventually arriving reply can
+        still release `_blocking` and drain the chain, but its user reply
+        callbacks are detached so no ghost waiter fires.
+
+        """
+        if settlement.state in (_SyncRpcSettlement.SETTLED,
+                                _SyncRpcSettlement.ABANDONED):
+            return
+
+        if settlement.state == _SyncRpcSettlement.ENQUEUED:
+            entry = settlement.blocked_entry
+            if entry is not None:
+                self._remove_blocked_entry(entry)
+                settlement.blocked_entry = None
+            settlement.state = _SyncRpcSettlement.ABANDONED
+            LOGGER.debug('Abandoned queued synchronous method: %s',
+                         settlement.method)
+            return
+
+        if settlement.callback is not None and settlement.acceptable_replies:
+            self.callbacks.remove_reply_callbacks(self.channel_number,
+                                                  settlement.acceptable_replies,
+                                                  settlement.callback)
+            settlement.callback = None
+        settlement.state = _SyncRpcSettlement.ABANDONED
+        LOGGER.debug(
+            'Abandoned in-flight synchronous method (detached reply '
+            'callbacks): %s', settlement.method)
+
+    def _remove_blocked_entry(self, target: _BlockedSyncRpc) -> None:
+        """Identity-based removal of one entry from `_blocked`, preserving
+        the order of every other entry (plain equality could match a
+        different request with an identical triple).
+
+        """
+        if not any(entry is target for entry in self._blocked):
+            return
+        self._blocked = deque(
+            entry for entry in self._blocked if entry is not target)
 
     def _rpc(
         self,
         method: amqp_object.Method,
-        callback: Callable[..., Any] | None = None,
-        acceptable_replies: Sequence[type[amqp_object.Method] |
-                                     tuple[type[amqp_object.Method],
-                                           dict[str, Any]]] | None = None
+        callback: Optional[Callable[..., Any]] = None,
+        acceptable_replies: Optional[Sequence[Union[
+            Type[amqp_object.Method], Tuple[Type[amqp_object.Method],
+                                            Dict[str, Any]]]]] = None
     ) -> None:
-        """
-        Make a synchronous channel RPC call for a synchronous method frame.
-
-        If the channel is already in the blocking state, then enqueue the request,
+        """Make a synchronous channel RPC call for a synchronous method frame. If
+        the channel is already in the blocking state, then enqueue the request,
         but don't send it at this time; it will be eventually sent by
         `_on_synchronous_complete` after the prior blocking request receives a
         response. If the channel is not in the blocking state and
@@ -1579,14 +1951,15 @@ class Channel:
 
         NOTE: A callback must be accompanied by non-empty acceptable_replies.
 
-        :param method: The AMQP method to invoke
-        :param callback: The callback for the RPC response
-        :param acceptable_replies: A (possibly empty) sequence of
+        :param pika.amqp_object.Method method: The AMQP method to invoke
+        :param callable callback: The callback for the RPC response
+        :param list|None acceptable_replies: A (possibly empty) sequence of
             replies this RPC call expects or None
+
         """
         assert method.synchronous, (
-            f'Only synchronous-capable methods may be used with _rpc: {method!r}'
-        )
+            'Only synchronous-capable methods may be used with _rpc: %r' %
+            (method,))
 
         # Validate we got None or a list of acceptable_replies
         if not isinstance(acceptable_replies, (type(None), list)):
@@ -1611,39 +1984,16 @@ class Channel:
             LOGGER.debug(
                 'Already in blocking state, so enqueueing method %s; '
                 'acceptable_replies=%r', method, acceptable_replies)
-            self._blocked.append([method, callback, acceptable_replies])
+            settlement = self._make_settlement(method, callback,
+                                               acceptable_replies)
+            entry = _BlockedSyncRpc([method, callback, acceptable_replies],
+                                    settlement)
+            settlement.blocked_entry = entry
+            self._blocked.append(entry)
             return
 
-        # Note: _send_method can throw exceptions if there are framing errors
-        # or invalid data passed in. Call it here to prevent self._blocking
-        # from being set if an exception is thrown. This also prevents
-        # acceptable_replies registering callbacks when exceptions are thrown
-        self._send_method(method)
-
-        # If acceptable replies are set, add callbacks
-        if acceptable_replies:
-            # Block until a response frame is received for synchronous frames
-            self._blocking = method.NAME
-            LOGGER.debug(
-                'Entering blocking state on frame %s; acceptable_replies=%r',
-                method, acceptable_replies)
-
-            for reply in acceptable_replies:
-                if isinstance(reply, tuple):
-                    reply, arguments = reply
-                else:
-                    arguments = None
-                LOGGER.debug('Adding on_synchronous_complete callback')
-                self.callbacks.add(self.channel_number,
-                                   reply,
-                                   self._on_synchronous_complete,
-                                   arguments=arguments)
-                if callback is not None:
-                    LOGGER.debug('Adding passed-in RPC response callback')
-                    self.callbacks.add(self.channel_number,
-                                       reply,
-                                       callback,
-                                       arguments=arguments)
+        settlement = self._make_settlement(method, callback, acceptable_replies)
+        self._launch_rpc(method, callback, acceptable_replies, settlement)
 
     def _raise_if_not_open(self) -> None:
         """

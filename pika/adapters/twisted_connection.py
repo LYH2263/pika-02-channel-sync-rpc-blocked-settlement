@@ -265,9 +265,11 @@ class TwistedChannel:
             if self._closed:
                 return defer.fail(self._closed)
 
+            sync_window = self._channel._begin_sync_wait_window()
             d: defer.Deferred = defer.Deferred()
             self._calls.add(d)
             d.addCallback(self._clear_call, d)
+            d.addBoth(self._settle_sync_call, sync_window)
 
             def single_argument(*args) -> None:
                 """
@@ -285,6 +287,7 @@ class TwistedChannel:
             try:
                 method(*args, **kwargs)
             except Exception:
+                self._channel._end_sync_wait_window(sync_window, abandon=True)
                 return defer.fail()
             return d
 
@@ -293,6 +296,19 @@ class TwistedChannel:
     def _clear_call(self, ret: Any, d: defer.Deferred[Any]) -> Any:
         self._calls.discard(d)
         return ret
+
+    def _settle_sync_call(self, outcome: Any,
+                          sync_window: pika.channel._SyncWaitWindow) -> Any:
+        """End the call's synchronous-RPC wait window when its Deferred
+        resolves. A callback result closes it normally (restoring the
+        enclosing window's view); a Failure, including the channel-close
+        errback, abandons pending settlements so no queued method or
+        ghost reply callback survives. Deferred scheduling itself is
+        untouched: this rides the same one-shot callback chain.
+        """
+        abandon = isinstance(outcome, Failure)
+        self._channel._end_sync_wait_window(sync_window, abandon=abandon)
+        return outcome
 
     # Public Channel attributes
 
